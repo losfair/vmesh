@@ -4,20 +4,14 @@ import (
 	"github.com/songgao/water"
 )
 
-type Vif interface {
-	GetName() string
-	Send([]byte) (int, error)
-	Recv([]byte) (int, error)
-}
-
 type Tun struct {
 	ifce *water.Interface
 }
 
-func NewTun() (*Tun, error) {
+func NewTun(name string) (*Tun, error) {
 	ifce, err := water.New(water.Config{
-		DeviceType: water.TUN,
-		//PlatformSpecificParams: water.PlatformSpecificParams{ Name: os.Args[3], Persist: true },
+		DeviceType:             water.TUN,
+		PlatformSpecificParams: water.PlatformSpecificParams{Name: name},
 	})
 	if err != nil {
 		return nil, err

@@ -51,6 +51,8 @@ type NodeConfig struct {
 	ServerName         string       `json:"server_name"`
 	LocalAnnouncements []string     `json:"local_announcements"`
 	Peers              []PeerConfig `json:"peers"`
+	VifType            string       `json:"vif_type"`
+	VifName            string       `json:"vif_name"`
 }
 
 type PeerConfig struct {
@@ -82,12 +84,21 @@ func NewNode(config *NodeConfig) (*Node, error) {
 		return nil, errors.New("cannot load CA cert")
 	}
 
-	vif, err := NewTun()
-	if err != nil {
-		return nil, err
+	var vif Vif
+	switch config.VifType {
+	case "tun":
+		newVif, err := NewTun(config.VifName)
+		if err != nil {
+			return nil, err
+		}
+		vif = newVif
+	case "dummy", "":
+		vif = (*DummyVif)(nil)
+	default:
+		return nil, errors.New("invalid vif type")
 	}
 
-	log.Println("Virtual interface: ", vif.GetName())
+	log.Println("Virtual interface:", vif.GetName())
 
 	n := &Node{
 		Config:   config,
