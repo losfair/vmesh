@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+service VnetPeer {
+    rpc Input(stream Message) returns (stream Message) {}
+}
+
+message Message {
+    uint32 tag = 1;
+    bytes payload = 2;
+}
+
+message Announcement {
+    repeated Route routes = 1;
+}
+
+message Route {
+    bytes prefix = 1;
+    uint32 prefix_length = 2;
+    repeated Hop path = 3;
+}
+
+message Hop {
+    bytes id = 1;
+    uint32 latency = 2;
+}
