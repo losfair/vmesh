@@ -6,6 +6,7 @@ import (
 	"github.com/losfair/vnet"
 	"io/ioutil"
 	"log"
+	"syscall"
 	"time"
 )
 
@@ -13,6 +14,7 @@ func main() {
 	configPathFlag := flag.String("config", "config.json", "Path to configuration")
 	debugFlag := flag.Bool("debug", false, "Enable debug logging")
 	tableFlag := flag.String("table", "", "Path to periodically dump the routing table to")
+	dropPermissionsFlag := flag.Bool("drop_permissions", false, "Drop permissions from root to nobody")
 	flag.Parse()
 
 	var config vnet.NodeConfig
@@ -30,6 +32,16 @@ func main() {
 	node, err := vnet.NewNode(&config)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	// Drop permissions after NewNode() which may initialize the tun device
+	if *dropPermissionsFlag {
+		if err := syscall.Setgid(65534); err != nil {
+			log.Fatalln("setgid failed:", err)
+		}
+		if err := syscall.Setuid(65534); err != nil {
+			log.Fatalln("setuid failed:", err)
+		}
 	}
 
 	if len(*tableFlag) > 0 {
