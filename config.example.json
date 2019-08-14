@@ -1,0 +1,18 @@
+{
+  "listen_addr": "0.0.0.0:5120",
+  "ca": "/your_ca/ca.crt",
+  "cert": "/your_node/A.crt",
+  "private_key": "/your_node/A.key",
+  "server_name": "node1.test.example.com",
+  "local_announcements": [
+    "2001:db8::/32"
+  ],
+  "peers": [
+    {
+      "addr": "8.8.8.8:5120",
+      "name": "node2.test.example.com"
+    }
+  ],
+  "vif_type": "tun",
+  "vif_name": "tun-vnet"
+}
