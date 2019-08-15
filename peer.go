@@ -109,14 +109,23 @@ func (p *Peer) HandleMessage(msg *protocol.Message) error {
 			if _oldRoute, ok := p.Node.Routes[int(rt.PrefixLength)].Load(prefix); ok {
 				oldRoute := _oldRoute.(RouteInfo)
 
-				// Should forward to local vif
+				// Do NOT add route if:
+				// - This route points to the local vif.
+				// - The old peer is alive, the updated route comes from the same peer, and that peer did not change its own route.
+				// - The old peer is alive, the updated route comes from a different peer and does not have a latency of at least 10ms lower than our current one.
 				if len(oldRoute.Route.Path) == 0 {
 					addRoute = false
 				} else {
 					if _, ok := p.Node.Peers.Load(oldRoute.NextPeerID); ok {
-						// Allow 10ms fluctuation on latency
-						if oldRoute.TotalLatency <= info.TotalLatency || oldRoute.TotalLatency-info.TotalLatency < 10 {
-							addRoute = false
+						if oldRoute.NextPeerID == info.NextPeerID {
+							// Update our route if the peer updated their routing path
+							if hopPathEqual(oldRoute.Route, info.Route) {
+								addRoute = false
+							}
+						} else {
+							if oldRoute.TotalLatency <= info.TotalLatency || oldRoute.TotalLatency-info.TotalLatency < 10 {
+								addRoute = false
+							}
 						}
 					}
 				}
@@ -220,4 +229,19 @@ func (p *Peer) Start() error {
 
 func (p *Peer) Stop() {
 	close(p.stop)
+}
+
+func hopPathEqual(left, right *protocol.Route) bool {
+	if len(left.Path) != len(right.Path) {
+		return false
+	}
+
+	for i, leftHop := range left.Path {
+		rightHop := right.Path[i]
+		if !bytes.Equal(leftHop.Id, rightHop.Id) {
+			return false
+		}
+	}
+
+	return true
 }
