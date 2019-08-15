@@ -90,9 +90,15 @@ func (p *Peer) HandleMessage(msg *protocol.Message) error {
 
 			if _oldRoute, ok := p.Node.Routes[int(rt.PrefixLength)].Load(prefix); ok {
 				oldRoute := _oldRoute.(RouteInfo)
-				if _, ok := p.Node.Peers.Load(oldRoute.NextPeerID); ok {
-					if oldRoute.TotalLatency <= info.TotalLatency {
-						addRoute = false
+
+				// Should forward to local vif
+				if len(oldRoute.Route.Path) == 0 {
+					addRoute = false
+				} else {
+					if _, ok := p.Node.Peers.Load(oldRoute.NextPeerID); ok {
+						if oldRoute.TotalLatency <= info.TotalLatency {
+							addRoute = false
+						}
 					}
 				}
 			}
