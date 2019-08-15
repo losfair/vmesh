@@ -15,6 +15,7 @@ import (
 	peer2 "google.golang.org/grpc/peer"
 	"io/ioutil"
 	"log"
+	"math"
 	"net"
 	"sort"
 	"strings"
@@ -280,7 +281,8 @@ func (n *Node) PersistingConnect(remoteAddr, remoteServerName string, oldError e
 		if err != nil && strings.Contains(err.Error(), "detected multiple connections") {
 			// - 1. Another thread has initiated a connection. (so it is responsible for reconnecting)
 			// - 2. The remote peer has actively connected to us. (so the remote peer is responsible for reconnecting)
-			log.Println("Not reconnecting since we should already have a connection to the remote peer")
+			// In practice we do need to reconnect here sometimes. So just sleep longer.
+			time.Sleep(RetryDelay * 10)
 			break
 		}
 		log.Printf("Connecting to %s/%s\n", remoteAddr, remoteServerName)
@@ -353,6 +355,8 @@ func (n *Node) ProcessMessageStream(stream MessageStream) error {
 		RemoteCert: remoteCert,
 		RemoteID:   remoteID,
 		Out:        peerOut,
+
+		atomicLatency: math.MaxUint32, // before we get the latency measurement information
 	}
 
 	if _, loaded := n.Peers.LoadOrStore(remoteID, nil); loaded {

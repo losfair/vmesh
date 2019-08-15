@@ -7,7 +7,10 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/losfair/vnet/protocol"
 	"log"
+	"math"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,6 +20,8 @@ const (
 	MessageTag_Invalid MessageTag = iota
 	MessageTag_IP
 	MessageTag_Announce
+	MessageTag_Ping
+	MessageTag_Pong
 )
 
 type PeerID [32]byte
@@ -30,6 +35,19 @@ type Peer struct {
 	Out        chan<- *protocol.Message
 
 	stop chan struct{}
+
+	latency       LatencyMeasurementState
+	atomicLatency uint32
+}
+
+type LatencyMeasurementState struct {
+	sync.Mutex
+	inProgress   bool
+	measureStart time.Time
+}
+
+func (p *Peer) GetLatencyMs() uint32 {
+	return atomic.LoadUint32(&p.atomicLatency)
 }
 
 func (p *Peer) HandleMessage(msg *protocol.Message) error {
@@ -96,7 +114,8 @@ func (p *Peer) HandleMessage(msg *protocol.Message) error {
 					addRoute = false
 				} else {
 					if _, ok := p.Node.Peers.Load(oldRoute.NextPeerID); ok {
-						if oldRoute.TotalLatency <= info.TotalLatency {
+						// Allow 10ms fluctuation on latency
+						if oldRoute.TotalLatency <= info.TotalLatency || oldRoute.TotalLatency-info.TotalLatency < 10 {
 							addRoute = false
 						}
 					}
@@ -109,6 +128,35 @@ func (p *Peer) HandleMessage(msg *protocol.Message) error {
 			}
 		}
 
+		return nil
+	case MessageTag_Ping:
+		select {
+		case p.Out <- &protocol.Message{Tag: uint32(MessageTag_Pong)}:
+		default:
+		}
+		return nil
+	case MessageTag_Pong:
+		p.latency.Lock()
+		defer p.latency.Unlock()
+
+		if !p.latency.inProgress {
+			return errors.New("Pong received without a previous Ping")
+		}
+		p.latency.inProgress = false
+		now := time.Now()
+		if now.Before(p.latency.measureStart) {
+			log.Println("Ignoring Pong as now.Before(p.latency.measureStart) == true")
+			return nil
+		}
+		latencyMs := uint32(now.Sub(p.latency.measureStart).Nanoseconds() / int64(time.Millisecond))
+		oldLatencyMs := atomic.LoadUint32(&p.atomicLatency)
+
+		// latency is known before...
+		if oldLatencyMs != math.MaxUint32 {
+			latencyMs = uint32((uint64(oldLatencyMs) + uint64(latencyMs)) / 2)
+		}
+
+		atomic.StoreUint32(&p.atomicLatency, latencyMs)
 		return nil
 	default:
 		return errors.New("unknown message tag")
@@ -127,6 +175,20 @@ func (p *Peer) Start() error {
 			case <-p.stop:
 				return
 			case <-ticker.C:
+				// Test latency.
+				{
+					p.latency.Lock()
+					if !p.latency.inProgress {
+						select {
+						case p.Out <- &protocol.Message{Tag: uint32(MessageTag_Ping)}:
+							p.latency.inProgress = true
+							p.latency.measureStart = time.Now()
+						default:
+						}
+					}
+					p.latency.Unlock()
+				}
+
 				routes := make([]*protocol.Route, 0)
 				for i, _ := range p.Node.Routes {
 					m := &p.Node.Routes[i]
@@ -135,7 +197,7 @@ func (p *Peer) Start() error {
 						route := *info.Route
 						route.Path = append([]*protocol.Hop{{
 							Id:      p.LocalID[:],
-							Latency: 1,
+							Latency: p.GetLatencyMs(),
 						}}, route.Path...)
 						routes = append(routes, &route)
 						return true
