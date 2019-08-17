@@ -119,7 +119,7 @@ func (p *Peer) HandleMessage(msg *protocol.Message) error {
 					if _, ok := p.Node.Peers.Load(oldRoute.NextPeerID); ok {
 						if oldRoute.NextPeerID == info.NextPeerID {
 							// Update our route if the peer updated their routing path
-							if hopPathEqual(oldRoute.Route, info.Route) {
+							if hopPathSimilar(oldRoute.Route, info.Route) {
 								addRoute = false
 							}
 						} else {
@@ -132,7 +132,7 @@ func (p *Peer) HandleMessage(msg *protocol.Message) error {
 			}
 
 			if addRoute {
-				log.Printf("Adding route. Prefix = %+v, PrefixLength = %d, NextHop = %x\n", net.IP(prefix[:]), rt.PrefixLength, info.NextPeerID)
+				log.Printf("Adding route. Prefix = %+v, PrefixLength = %d, NextHop = %x, Latency = %d\n", net.IP(prefix[:]), rt.PrefixLength, info.NextPeerID, info.TotalLatency)
 				p.Node.Routes[int(rt.PrefixLength)].Store(prefix, info)
 			}
 		}
@@ -231,17 +231,40 @@ func (p *Peer) Stop() {
 	close(p.stop)
 }
 
-func hopPathEqual(left, right *protocol.Route) bool {
+func hopPathSimilar(left, right *protocol.Route) bool {
 	if len(left.Path) != len(right.Path) {
 		return false
 	}
+
+	var leftTotalLatency uint64
+	var rightTotalLatency uint64
 
 	for i, leftHop := range left.Path {
 		rightHop := right.Path[i]
 		if !bytes.Equal(leftHop.Id, rightHop.Id) {
 			return false
 		}
+
+		leftLatency, rightLatency := uint64(leftHop.Latency), uint64(rightHop.Latency)
+		if AbsDiffUint64(leftLatency, rightLatency) > 5 {
+			return false
+		}
+
+		leftTotalLatency += leftLatency
+		rightTotalLatency += rightLatency
+	}
+
+	if AbsDiffUint64(leftTotalLatency, rightTotalLatency) > 10 {
+		return false
 	}
 
 	return true
+}
+
+func AbsDiffUint64(left, right uint64) uint64 {
+	if left > right {
+		return left - right
+	} else {
+		return right - left
+	}
 }
