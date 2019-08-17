@@ -283,7 +283,7 @@ func (n *Node) PersistingConnect(remoteAddr, remoteServerName string, oldError e
 			// - 2. The remote peer has actively connected to us. (so the remote peer is responsible for reconnecting)
 			// In practice we do need to reconnect here sometimes. So just sleep longer.
 			time.Sleep(RetryDelay * 10)
-			break
+			continue
 		}
 		log.Printf("Connecting to %s/%s\n", remoteAddr, remoteServerName)
 		if err = n.Connect(remoteAddr, remoteServerName, true); err != nil {
@@ -314,6 +314,12 @@ func (n *Node) Connect(remoteAddr, remoteServerName string, persist bool) error 
 
 	go func() {
 		err := n.ProcessMessageStream(session)
+
+		closeErr := session.CloseSend()
+		if closeErr != nil {
+			log.Println("CloseSend() returns error:", closeErr)
+		}
+
 		log.Printf("Session closed, error = %+v\n", err)
 		if persist {
 			time.Sleep(RetryDelay)
@@ -371,10 +377,13 @@ func (n *Node) ProcessMessageStream(stream MessageStream) error {
 
 	n.Peers.Store(remoteID, peer)
 
+	fullyClosed := make(chan struct{})
+
 	go func() {
 		defer func() {
 			peer.Stop()
 			n.Peers.Delete(remoteID)
+			close(fullyClosed)
 		}()
 
 		for {
@@ -390,7 +399,10 @@ func (n *Node) ProcessMessageStream(stream MessageStream) error {
 		}
 	}()
 
-	defer close(stop)
+	defer func() {
+		close(stop)
+		<-fullyClosed
+	}()
 
 	log.Printf("Initialized stream with peer %x\n", peer.RemoteID)
 
