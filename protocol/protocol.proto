@@ -23,3 +23,9 @@ message Hop {
     bytes id = 1;
     uint32 latency = 2;
 }
+
+message DistributedConfig {
+    uint32 version = 1;
+    bytes certificate = 2;
+    bytes content = 3;
+}
