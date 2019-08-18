@@ -283,6 +283,7 @@ func (n *Node) PersistingConnect(remoteAddr, remoteServerName string, oldError e
 			// - 2. The remote peer has actively connected to us. (so the remote peer is responsible for reconnecting)
 			// In practice we do need to reconnect here sometimes. So just sleep longer.
 			time.Sleep(RetryDelay * 10)
+			err = nil
 			continue
 		}
 		log.Printf("Connecting to %s/%s\n", remoteAddr, remoteServerName)
