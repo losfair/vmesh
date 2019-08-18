@@ -308,11 +308,6 @@ func (n *Node) DispatchIPPacket(payload []byte) error {
 		return err
 	}
 
-	currentTime := time.Now()
-	if currentTime.After(routeInfo.UpdateTime) && currentTime.Sub(routeInfo.UpdateTime) > RouteTimeout {
-		return errors.New("route timeout")
-	}
-
 	if len(routeInfo.Route.Path) == 0 {
 		// Dispatch to local Vif
 		// nextPeer is nil here
@@ -323,6 +318,11 @@ func (n *Node) DispatchIPPacket(payload []byte) error {
 			return err
 		}
 	} else {
+		// Only check timeout for non-local routes
+		currentTime := time.Now()
+		if currentTime.After(routeInfo.UpdateTime) && currentTime.Sub(routeInfo.UpdateTime) > RouteTimeout {
+			return errors.New("route timeout")
+		}
 		select {
 		case nextPeer.Out <- &protocol.Message{Tag: uint32(MessageTag_IP), Payload: payload}:
 		default:
