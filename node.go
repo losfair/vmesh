@@ -1,10 +1,13 @@
 package vnet
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/google/gopacket"
@@ -24,24 +27,30 @@ import (
 )
 
 const RetryDelay = 10 * time.Second
+const RouteTimeout = 1 * time.Minute
 
 type Node struct {
 	Config   *NodeConfig
 	CAPool   *x509.CertPool
 	FullCert tls.Certificate
+	LocalID  PeerID
+	Domain   string
 
 	// Values of the `Peers` map can be temporarily nil to indicate a peer is being initialized.
 	Peers sync.Map // PeerID -> *Peer
 
-	Routes [129]sync.Map // prefix_len -> (IPV6 Address ([16]byte) -> RouteInfo)
+	RoutingTable LikeRoutingTable
 
 	Vif Vif
+
+	DCState DistributedConfigState
 }
 
 type RouteInfo struct {
 	Route        *protocol.Route
 	NextPeerID   PeerID
 	TotalLatency uint64
+	UpdateTime   time.Time
 }
 
 type NodeConfig struct {
@@ -54,6 +63,53 @@ type NodeConfig struct {
 	Peers              []PeerConfig `json:"peers"`
 	VifType            string       `json:"vif_type"`
 	VifName            string       `json:"vif_name"`
+}
+
+type DistributedConfigState struct {
+	sync.Mutex
+	updateTime time.Time
+	Config     *DistributedConfig
+	RawConfig  *protocol.DistributedConfig
+
+	PrefixWhitelistTable map[string]*LikeRoutingTable
+}
+
+func (s *DistributedConfigState) PrefixIsWhitelisted(name string, prefix [16]byte, prefixLen uint8) bool {
+	s.Lock()
+	table, ok := s.PrefixWhitelistTable[name]
+	s.Unlock()
+
+	// Allow by default if no entry is found in whitelist
+	if !ok {
+		return true
+	}
+
+	found := false
+
+	_ = table.Lookup(prefix, prefixLen, func(_ [16]byte, _ uint8, _ interface{}) bool {
+		found = true
+		return false
+	})
+
+	return found
+}
+
+func (s *DistributedConfigState) updatePrefixWhitelistTableLocked() {
+	s.PrefixWhitelistTable = make(map[string]*LikeRoutingTable)
+
+	for name, allowed := range s.Config.PrefixWhitelist {
+		table := &LikeRoutingTable{}
+		for _, elem := range allowed {
+			if err := table.InsertCIDR(elem, struct{}{}); err != nil {
+				log.Println("failed to insert CIDR-format network into whitelist:", err)
+			}
+		}
+		s.PrefixWhitelistTable[name] = table
+	}
+}
+
+type DistributedConfig struct {
+	PrefixWhitelist map[string][]string `json:"prefix_whitelist"` // node **name** -> list of allowed prefixes
 }
 
 type PeerConfig struct {
@@ -99,14 +155,27 @@ func NewNode(config *NodeConfig) (*Node, error) {
 		return nil, errors.New("invalid vif type")
 	}
 
-	log.Println("Virtual interface:", vif.GetName())
+	domainParts := strings.SplitN(fullCert.Leaf.Subject.CommonName, ".", 2)
+	if len(domainParts) != 2 {
+		return nil, errors.New("invalid common name")
+	}
 
 	n := &Node{
 		Config:   config,
 		CAPool:   caPool,
 		FullCert: fullCert,
+		LocalID:  peerIDFromCertificate(fullCert.Leaf),
+		Domain:   domainParts[1],
 		Vif:      vif,
+		DCState: DistributedConfigState{
+			PrefixWhitelistTable: make(map[string]*LikeRoutingTable),
+		},
 	}
+
+	log.Println("Virtual interface:", vif.GetName())
+	log.Printf("Local ID: %x\n", n.LocalID)
+	log.Println("Domain:", n.Domain)
+	log.Println("Local name:", n.FullCert.Leaf.Subject.CommonName)
 
 	if len(config.LocalAnnouncements) > 0 {
 		for _, ann := range config.LocalAnnouncements {
@@ -123,13 +192,15 @@ func NewNode(config *NodeConfig) (*Node, error) {
 			var prefix [16]byte
 
 			copy(prefix[:], ipnet.IP)
-			n.Routes[prefixLen].Store(prefix, RouteInfo{
+			if err := n.RoutingTable.Insert(prefix, uint8(prefixLen), RouteInfo{
 				Route: &protocol.Route{
-					Prefix:       ipnet.IP,
+					Prefix:       ipnet.IP.Mask(ipnet.Mask),
 					PrefixLength: uint32(prefixLen),
 				},
 				TotalLatency: 0,
-			})
+			}); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -137,26 +208,80 @@ func NewNode(config *NodeConfig) (*Node, error) {
 }
 
 func (n *Node) BuildPrintableRoutingTable() string {
-	builder := strings.Builder{}
-	for i := 128; i >= 0; i-- {
-		entry := &n.Routes[i]
-		routes := make([]string, 0)
-		entry.Range(func(_, _info interface{}) bool {
-			info := _info.(RouteInfo)
-			prettyPath := strings.Builder{}
-			for _, item := range info.Route.Path {
-				prettyPath.WriteString(fmt.Sprintf("    %x (Latency: %d)\n", item.Id, item.Latency))
-			}
-			routes = append(
-				routes,
-				fmt.Sprintf("ROUTE: %s/%d\n  Latency: %d\n  Path:\n%s", net.IP(info.Route.Prefix), info.Route.PrefixLength, info.TotalLatency, prettyPath.String()),
-			)
-			return true
-		})
-		sort.Strings(routes)
-		builder.WriteString(strings.Join(routes, "\n"))
+	routes := make([]string, 0)
+
+	n.RoutingTable.Range(func(prefix [16]byte, prefixLen uint8, _info interface{}) bool {
+		info := _info.(RouteInfo)
+		prettyPath := strings.Builder{}
+		for _, item := range info.Route.Path {
+			prettyPath.WriteString(fmt.Sprintf("    %x (Latency: %d)\n", item.Id, item.Latency))
+		}
+		routes = append(
+			routes,
+			fmt.Sprintf("ROUTE: %s/%d\n  Latency: %d\n  Path:\n%s", net.IP(info.Route.Prefix), info.Route.PrefixLength, info.TotalLatency, prettyPath.String()),
+		)
+		return true
+	})
+	sort.Strings(routes)
+	return strings.Join(routes, "\n")
+}
+
+func (n *Node) UpdateDistributedConfig(dc *protocol.DistributedConfig) error {
+	if dc.Version != 1 {
+		return errors.New("unsupported distributed config version")
 	}
-	return builder.String()
+
+	cert, err := x509.ParseCertificate(dc.Certificate)
+	if err != nil {
+		return errors.New("cannot parse certificate for DC")
+	}
+
+	_, err = cert.Verify(x509.VerifyOptions{
+		Roots: n.CAPool,
+	})
+	if err != nil {
+		return errors.New("cannot verify certificate for DC")
+	}
+
+	if len(cert.URIs) != 1 {
+		return errors.New("invalid URIs in DC certificate")
+	}
+
+	if cert.URIs[0].Scheme != "vnet-conf" {
+		return errors.New("invalid URI scheme in DC certificate")
+	}
+
+	n.DCState.Lock()
+	defer n.DCState.Unlock()
+
+	if n.DCState.Config != nil && (cert.NotBefore.Before(n.DCState.updateTime) || cert.NotBefore.Equal(n.DCState.updateTime)) {
+		return errors.New("received DC is not newer than our current one, rejected")
+	}
+
+	hashSum, err := hex.DecodeString(cert.URIs[0].Host)
+	if err != nil {
+		return errors.New("invalid hash sum in DC certificate")
+	}
+
+	computedHash := sha256.Sum256(dc.Content)
+	if !bytes.Equal(computedHash[:], hashSum) {
+		return errors.New("hash mismatch between DC certificate and content")
+	}
+
+	var dconf DistributedConfig
+
+	err = json.Unmarshal(dc.Content, &dconf)
+	if err != nil {
+		return errors.New("cannot decode distributed config")
+	}
+
+	n.DCState.Config = &dconf
+	n.DCState.RawConfig = dc
+	n.DCState.updateTime = cert.NotBefore
+
+	n.DCState.updatePrefixWhitelistTableLocked()
+
+	return nil
 }
 
 func (n *Node) DispatchIPPacket(payload []byte) error {
@@ -183,6 +308,11 @@ func (n *Node) DispatchIPPacket(payload []byte) error {
 		return err
 	}
 
+	currentTime := time.Now()
+	if currentTime.After(routeInfo.UpdateTime) && currentTime.Sub(routeInfo.UpdateTime) > RouteTimeout {
+		return errors.New("route timeout")
+	}
+
 	if len(routeInfo.Route.Path) == 0 {
 		// Dispatch to local Vif
 		// nextPeer is nil here
@@ -202,30 +332,38 @@ func (n *Node) DispatchIPPacket(payload []byte) error {
 	return nil
 }
 
-func (n *Node) GetRouteForAddress(_addr net.IP) (RouteInfo, *Peer, error) {
+func (n *Node) GetRouteForAddress(_addr net.IP) (retRouteInfo RouteInfo, retPeer *Peer, retErr error) {
 	if len(_addr) != 16 {
 		return RouteInfo{}, nil, errors.New("invalid address")
 	}
 
 	var addr [16]byte
 	copy(addr[:], _addr)
+	var found bool
 
-	for i := 128; i >= 0; i-- {
-		if i != 128 {
-			addr[i/8] &= 0xff << uint32(8-i%8)
+	if err := n.RoutingTable.Lookup(addr, 128, func(_ [16]byte, _ uint8, _routeInfo interface{}) bool {
+		routeInfo := _routeInfo.(RouteInfo)
+		if len(routeInfo.Route.Path) == 0 {
+			retRouteInfo = routeInfo
+			found = true
+			return false // local
 		}
-		if rt, ok := n.Routes[i].Load(addr); ok {
-			routeInfo := rt.(RouteInfo)
-			if len(routeInfo.Route.Path) == 0 {
-				return routeInfo, nil, nil // local
-			}
-			if peer, ok := n.Peers.Load(routeInfo.NextPeerID); ok && peer != nil {
-				return routeInfo, peer.(*Peer), nil
-			}
+		if peer, ok := n.Peers.Load(routeInfo.NextPeerID); ok && peer != nil {
+			retRouteInfo = routeInfo
+			retPeer = peer.(*Peer)
+			found = true
+			return false
 		}
+		return true
+	}); err != nil {
+		retErr = err
+		return
 	}
 
-	return RouteInfo{}, nil, errors.New("route not found")
+	if !found {
+		retErr = errors.New("route not found")
+	}
+	return
 }
 
 func (n *Node) Run() error {
@@ -351,16 +489,22 @@ func (n *Node) ProcessMessageStream(stream MessageStream) error {
 	}
 
 	remoteCert := tlsInfo.State.VerifiedChains[0][0]
+	remoteName := remoteCert.Subject.CommonName
 	remoteID := peerIDFromCertificate(remoteCert)
+
+	if !strings.HasSuffix(remoteName, "."+n.Domain) {
+		return errors.New("the common name of the peer is not in the same domain as the local node")
+	}
 
 	peerOut := make(chan *protocol.Message, 128)
 
 	peer := &Peer{
 		Node:       n,
 		LocalCert:  n.FullCert.Leaf,
-		LocalID:    peerIDFromCertificate(n.FullCert.Leaf),
+		LocalID:    n.LocalID,
 		RemoteCert: remoteCert,
 		RemoteID:   remoteID,
+		RemoteName: remoteName,
 		Out:        peerOut,
 
 		atomicLatency: math.MaxUint32, // before we get the latency measurement information
@@ -405,7 +549,7 @@ func (n *Node) ProcessMessageStream(stream MessageStream) error {
 		<-fullyClosed
 	}()
 
-	log.Printf("Initialized stream with peer %x\n", peer.RemoteID)
+	log.Printf("Initialized stream with peer %x (%s)\n", peer.RemoteID, peer.RemoteName)
 
 	for {
 		msg, err := stream.Recv()

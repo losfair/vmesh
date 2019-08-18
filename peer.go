@@ -9,6 +9,7 @@ import (
 	"log"
 	"math"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,6 +23,7 @@ const (
 	MessageTag_Announce
 	MessageTag_Ping
 	MessageTag_Pong
+	MessageTag_UpdateDistributedConfig
 )
 
 type PeerID [32]byte
@@ -32,6 +34,7 @@ type Peer struct {
 	LocalID    PeerID
 	RemoteCert *x509.Certificate
 	RemoteID   PeerID
+	RemoteName string
 	Out        chan<- *protocol.Message
 
 	stop chan struct{}
@@ -80,6 +83,11 @@ func (p *Peer) HandleMessage(msg *protocol.Message) error {
 			var prefix [16]byte
 			copy(prefix[:], rt.Prefix)
 
+			if !p.Node.DCState.PrefixIsWhitelisted(p.RemoteName, prefix, uint8(rt.PrefixLength)) {
+				// Explicitly not whitelisted
+				continue
+			}
+
 			if len(rt.Path) == 0 || !bytes.Equal(rt.Path[0].Id, p.RemoteID[:]) {
 				return errors.New("invalid path")
 			}
@@ -102,25 +110,36 @@ func (p *Peer) HandleMessage(msg *protocol.Message) error {
 				Route:        rt,
 				NextPeerID:   p.RemoteID,
 				TotalLatency: totalLatency,
+				UpdateTime:   time.Now(),
 			}
 
 			addRoute := true
+			displayRouteUpdateMessage := true
 
-			if _oldRoute, ok := p.Node.Routes[int(rt.PrefixLength)].Load(prefix); ok {
+			if err := p.Node.RoutingTable.Lookup(prefix, uint8(rt.PrefixLength), func(gotPrefix [16]byte, gotPrefixLen uint8, _oldRoute interface{}) bool {
+				if uint32(gotPrefixLen) != rt.PrefixLength {
+					return false
+				}
+
 				oldRoute := _oldRoute.(RouteInfo)
 
-				// Do NOT add route if:
-				// - This route points to the local vif.
-				// - The old peer is alive, the updated route comes from the same peer, and that peer did not change its own route.
-				// - The old peer is alive, the updated route comes from a different peer and does not have a latency of at least 10ms lower than our current one.
+				// Rules:
+				// - If this route points to the local vif, do not add route.
+				// - If the old route is too old, add route.
+				// - (majority case) If the old peer is alive, the updated route comes from the same peer, and that peer does not have major change in its route, add route without displaying message.
+				// - If the old peer is alive, the updated route comes from the same peer, and that peer has major change in its route, add route.
+				// - If the old peer is alive, the updated route comes from a different peer and does not have a latency of at least 10ms lower than our current one, do not add route.
+				// - Otherwise, add route.
 				if len(oldRoute.Route.Path) == 0 {
 					addRoute = false
+				} else if info.UpdateTime.After(oldRoute.UpdateTime) && info.UpdateTime.Sub(oldRoute.UpdateTime) > RouteTimeout {
+					// add route
 				} else {
 					if _, ok := p.Node.Peers.Load(oldRoute.NextPeerID); ok {
 						if oldRoute.NextPeerID == info.NextPeerID {
-							// Update our route if the peer updated their routing path
+							// Most time this branch should be hit.
 							if hopPathSimilar(oldRoute.Route, info.Route) {
-								addRoute = false
+								displayRouteUpdateMessage = false
 							}
 						} else {
 							if oldRoute.TotalLatency <= info.TotalLatency || oldRoute.TotalLatency-info.TotalLatency < 10 {
@@ -129,11 +148,18 @@ func (p *Peer) HandleMessage(msg *protocol.Message) error {
 						}
 					}
 				}
+				return false
+			}); err != nil {
+				return err
 			}
 
 			if addRoute {
-				log.Printf("Adding route. Prefix = %+v, PrefixLength = %d, NextHop = %x, Latency = %d\n", net.IP(prefix[:]), rt.PrefixLength, info.NextPeerID, info.TotalLatency)
-				p.Node.Routes[int(rt.PrefixLength)].Store(prefix, info)
+				if displayRouteUpdateMessage {
+					log.Printf("Updating route. Prefix = %+v, PrefixLength = %d, NextHop = %x, Latency = %d\n", net.IP(prefix[:]), rt.PrefixLength, info.NextPeerID, info.TotalLatency)
+				}
+				if err := p.Node.RoutingTable.Insert(prefix, uint8(rt.PrefixLength), info); err != nil {
+					log.Println("Unable to insert route into routing table:", err)
+				}
 			}
 		}
 
@@ -167,6 +193,20 @@ func (p *Peer) HandleMessage(msg *protocol.Message) error {
 
 		atomic.StoreUint32(&p.atomicLatency, latencyMs)
 		return nil
+	case MessageTag_UpdateDistributedConfig:
+		var dconf protocol.DistributedConfig
+		if err := proto.Unmarshal(msg.Payload, &dconf); err != nil {
+			return errors.New("Unable to unmarshal received distributed config")
+		}
+		if err := p.Node.UpdateDistributedConfig(&dconf); err != nil {
+			if !strings.Contains(err.Error(), "received DC is not newer than our current one") {
+				log.Println("Error updating distributed config:", err)
+				return errors.New("invalid distributed config")
+			}
+		} else {
+			log.Println("Applied distributed config.")
+		}
+		return nil
 	default:
 		return errors.New("unknown message tag")
 	}
@@ -198,10 +238,29 @@ func (p *Peer) Start() error {
 					p.latency.Unlock()
 				}
 
-				routes := make([]*protocol.Route, 0)
-				for i, _ := range p.Node.Routes {
-					m := &p.Node.Routes[i]
-					m.Range(func(_, _info interface{}) bool {
+				// Send distributed config.
+				{
+					p.Node.DCState.Lock()
+					dconf := p.Node.DCState.RawConfig
+					p.Node.DCState.Unlock()
+
+					if dconf != nil {
+						serialized, err := proto.Marshal(dconf)
+						if err != nil {
+							log.Println("Unable to marshal distributed config:", err)
+						} else {
+							select {
+							case p.Out <- &protocol.Message{Tag: uint32(MessageTag_UpdateDistributedConfig), Payload: serialized}:
+							default:
+							}
+						}
+					}
+				}
+
+				// Announce routes.
+				{
+					routes := make([]*protocol.Route, 0)
+					p.Node.RoutingTable.Range(func(_ [16]byte, _ uint8, _info interface{}) bool {
 						info := _info.(RouteInfo)
 						route := *info.Route
 						route.Path = append([]*protocol.Hop{{
@@ -211,15 +270,16 @@ func (p *Peer) Start() error {
 						routes = append(routes, &route)
 						return true
 					})
-				}
-				ann := &protocol.Announcement{Routes: routes}
-				serialized, err := proto.Marshal(ann)
-				if err != nil {
-					continue
-				}
-				select {
-				case p.Out <- &protocol.Message{Tag: uint32(MessageTag_Announce), Payload: serialized}:
-				default:
+					ann := &protocol.Announcement{Routes: routes}
+					serialized, err := proto.Marshal(ann)
+					if err != nil {
+						log.Println("Unable to marshal announcement:", err)
+					} else {
+						select {
+						case p.Out <- &protocol.Message{Tag: uint32(MessageTag_Announce), Payload: serialized}:
+						default:
+						}
+					}
 				}
 			}
 		}
