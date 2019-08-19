@@ -260,8 +260,13 @@ func (p *Peer) Start() error {
 				// Announce routes.
 				{
 					routes := make([]*protocol.Route, 0)
-					p.Node.RoutingTable.Range(func(_ [16]byte, _ uint8, _info interface{}) bool {
+					p.Node.RoutingTable.Range(func(prefix [16]byte, prefixLen uint8, _info interface{}) bool {
 						info := _info.(RouteInfo)
+						if !routeIsValid(info) {
+							p.Node.RoutingTable.Delete(prefix, prefixLen)
+							return true
+						}
+
 						route := *info.Route
 						route.Path = append([]*protocol.Hop{{
 							Id:      p.LocalID[:],

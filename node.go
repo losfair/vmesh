@@ -318,11 +318,6 @@ func (n *Node) DispatchIPPacket(payload []byte) error {
 			return err
 		}
 	} else {
-		// Only check timeout for non-local routes
-		currentTime := time.Now()
-		if currentTime.After(routeInfo.UpdateTime) && currentTime.Sub(routeInfo.UpdateTime) > RouteTimeout {
-			return errors.New("route timeout")
-		}
 		select {
 		case nextPeer.Out <- &protocol.Message{Tag: uint32(MessageTag_IP), Payload: payload}:
 		default:
@@ -341,8 +336,13 @@ func (n *Node) GetRouteForAddress(_addr net.IP) (retRouteInfo RouteInfo, retPeer
 	copy(addr[:], _addr)
 	var found bool
 
-	if err := n.RoutingTable.Lookup(addr, 128, func(_ [16]byte, _ uint8, _routeInfo interface{}) bool {
+	if err := n.RoutingTable.Lookup(addr, 128, func(prefix [16]byte, prefixLen uint8, _routeInfo interface{}) bool {
 		routeInfo := _routeInfo.(RouteInfo)
+		if !routeIsValid(routeInfo) {
+			n.RoutingTable.Delete(prefix, prefixLen)
+			return true
+		}
+
 		if len(routeInfo.Route.Path) == 0 {
 			retRouteInfo = routeInfo
 			found = true
@@ -572,4 +572,17 @@ func (p *PeerServer) Input(server protocol.VnetPeer_InputServer) error {
 
 func peerIDFromCertificate(cert *x509.Certificate) PeerID {
 	return sha256.Sum256(cert.Raw)
+}
+
+func routeIsValid(info RouteInfo) bool {
+	if len(info.Route.Path) == 0 {
+		// local route
+		return true
+	}
+
+	currentTime := time.Now()
+	if currentTime.After(info.UpdateTime) && currentTime.Sub(info.UpdateTime) > RouteTimeout {
+		return false
+	}
+	return true
 }

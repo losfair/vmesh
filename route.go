@@ -42,6 +42,18 @@ func (r *LikeRoutingTable) Lookup(prefix [16]byte, prefixLen uint8, callback fun
 	return nil
 }
 
+func (r *LikeRoutingTable) Delete(prefix [16]byte, prefixLen uint8) {
+	if prefixLen > 128 {
+		return
+	}
+
+	for i := 127; i >= int(prefixLen); i-- {
+		prefix[i/8] &= 0xff << uint32(8-i%8)
+	}
+
+	r.Routes[int(prefixLen)].Delete(prefix)
+}
+
 func (r *LikeRoutingTable) Insert(prefix [16]byte, prefixLen uint8, value interface{}) error {
 	if prefixLen > 128 {
 		return errors.New("invalid prefix length")
