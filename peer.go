@@ -9,7 +9,6 @@ import (
 	"log"
 	"math"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -196,13 +195,17 @@ func (p *Peer) HandleMessage(msg *protocol.Message) error {
 	case MessageTag_UpdateDistributedConfig:
 		var dconf protocol.DistributedConfig
 		if err := proto.Unmarshal(msg.Payload, &dconf); err != nil {
-			return errors.New("Unable to unmarshal received distributed config")
-		}
-		if err := p.Node.UpdateDistributedConfig(&dconf); err != nil {
-			if !strings.Contains(err.Error(), "received DC is not newer than our current one") {
-				log.Println("Error updating distributed config:", err)
-				return errors.New("invalid distributed config")
+			if EnableDebug {
+				log.Println("Unable to unmarshal received distributed config")
 			}
+			return nil
+		}
+
+		if err := p.Node.UpdateDistributedConfig(&dconf); err != nil {
+			if EnableDebug {
+				log.Println("Error updating distributed config:", err)
+			}
+			return nil
 		} else {
 			log.Println("Applied distributed config.")
 		}

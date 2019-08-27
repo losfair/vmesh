@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"github.com/google/gopacket"
@@ -30,11 +31,13 @@ const RetryDelay = 10 * time.Second
 const RouteTimeout = 1 * time.Minute
 
 type Node struct {
-	Config   *NodeConfig
-	CAPool   *x509.CertPool
-	FullCert tls.Certificate
-	LocalID  PeerID
-	Domain   string
+	Config    *NodeConfig
+	CAPool    *x509.CertPool // Internal CA
+	CA        *x509.Certificate
+	PeerCerts PeerCertCollection // External Peers' certificates
+	FullCert  tls.Certificate
+	LocalID   PeerID
+	Domain    string
 
 	// Values of the `Peers` map can be temporarily nil to indicate a peer is being initialized.
 	Peers sync.Map // PeerID -> *Peer
@@ -46,6 +49,10 @@ type Node struct {
 	DCState DistributedConfigState
 }
 
+type PeerCertCollection struct {
+	Certs map[PeerID]*x509.Certificate
+}
+
 type RouteInfo struct {
 	Route        *protocol.Route
 	NextPeerID   PeerID
@@ -54,15 +61,16 @@ type RouteInfo struct {
 }
 
 type NodeConfig struct {
-	ListenAddr         string       `json:"listen_addr"`
-	CAPath             string       `json:"ca"`
-	CertPath           string       `json:"cert"`
-	PrivateKeyPath     string       `json:"private_key"`
-	ServerName         string       `json:"server_name"`
-	LocalAnnouncements []string     `json:"local_announcements"`
-	Peers              []PeerConfig `json:"peers"`
-	VifType            string       `json:"vif_type"`
-	VifName            string       `json:"vif_name"`
+	ListenAddr            string       `json:"listen_addr"`
+	CAPath                string       `json:"ca"`
+	ExternalPeerCertPaths []string     `json:"external_peer_certs"`
+	CertPath              string       `json:"cert"`
+	PrivateKeyPath        string       `json:"private_key"`
+	ServerName            string       `json:"server_name"`
+	LocalAnnouncements    []string     `json:"local_announcements"`
+	Peers                 []PeerConfig `json:"peers"`
+	VifType               string       `json:"vif_type"`
+	VifName               string       `json:"vif_name"`
 }
 
 type DistributedConfigState struct {
@@ -131,14 +139,41 @@ func NewNode(config *NodeConfig) (*Node, error) {
 		return nil, errors.New("cannot parse local certificate")
 	}
 
+	// The primary/internal CA
+	caPool := x509.NewCertPool()
 	caRaw, err := ioutil.ReadFile(config.CAPath)
 	if err != nil {
 		return nil, err
 	}
+	caPem, _ := pem.Decode(caRaw)
+	if caPem == nil {
+		return nil, errors.New("pem decoding failed")
+	}
+	ca, err := x509.ParseCertificate(caPem.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	caPool.AddCert(ca)
 
-	caPool := x509.NewCertPool()
-	if ok := caPool.AppendCertsFromPEM(caRaw); !ok {
-		return nil, errors.New("cannot load CA cert")
+	// External peers
+	peerCerts := PeerCertCollection{Certs: make(map[PeerID]*x509.Certificate)}
+	for _, alt := range config.ExternalPeerCertPaths {
+		raw, err := ioutil.ReadFile(alt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read peer certificate at %s: %+v", alt, err)
+		}
+
+		certPem, _ := pem.Decode(raw)
+		if certPem == nil {
+			return nil, errors.New("pem decoding failed")
+		}
+		cert, err := x509.ParseCertificate(certPem.Bytes)
+		if err != nil {
+			return nil, err
+		}
+
+		certID := peerIDFromCertificate(cert)
+		peerCerts.Certs[certID] = cert
 	}
 
 	var vif Vif
@@ -161,12 +196,14 @@ func NewNode(config *NodeConfig) (*Node, error) {
 	}
 
 	n := &Node{
-		Config:   config,
-		CAPool:   caPool,
-		FullCert: fullCert,
-		LocalID:  peerIDFromCertificate(fullCert.Leaf),
-		Domain:   domainParts[1],
-		Vif:      vif,
+		Config:    config,
+		CAPool:    caPool,
+		CA:        ca,
+		PeerCerts: peerCerts,
+		FullCert:  fullCert,
+		LocalID:   peerIDFromCertificate(fullCert.Leaf),
+		Domain:    domainParts[1],
+		Vif:       vif,
 		DCState: DistributedConfigState{
 			PrefixWhitelistTable: make(map[string]*LikeRoutingTable),
 		},
@@ -389,8 +426,7 @@ func (n *Node) Run() error {
 	creds := credentials.NewTLS(&tls.Config{
 		Certificates: []tls.Certificate{n.FullCert},
 		ServerName:   n.Config.ServerName,
-		ClientCAs:    n.CAPool,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientAuth:   tls.RequireAnyClientCert,
 	})
 
 	server := grpc.NewServer(grpc.Creds(creds))
@@ -437,9 +473,9 @@ func (n *Node) PersistingConnect(remoteAddr, remoteServerName string, oldError e
 
 func (n *Node) Connect(remoteAddr, remoteServerName string, persist bool) error {
 	creds := credentials.NewTLS(&tls.Config{
-		Certificates: []tls.Certificate{n.FullCert},
-		ServerName:   remoteServerName,
-		RootCAs:      n.CAPool,
+		Certificates:       []tls.Certificate{n.FullCert},
+		ServerName:         remoteServerName,
+		InsecureSkipVerify: true, // verification will be handled in ProcessMessageStream
 	})
 	conn, err := grpc.Dial(remoteAddr, grpc.WithTransportCredentials(creds))
 	if err != nil {
@@ -484,16 +520,33 @@ func (n *Node) ProcessMessageStream(stream MessageStream) error {
 		return errors.New("cannot get tls info")
 	}
 
-	if len(tlsInfo.State.VerifiedChains) == 0 || len(tlsInfo.State.VerifiedChains[0]) == 0 {
-		return errors.New("no verified certificates")
+	if len(tlsInfo.State.PeerCertificates) == 0 {
+		return errors.New("peer did not provide any certificates")
 	}
 
-	remoteCert := tlsInfo.State.VerifiedChains[0][0]
+	remoteCert := tlsInfo.State.PeerCertificates[0]
 	remoteName := remoteCert.Subject.CommonName
 	remoteID := peerIDFromCertificate(remoteCert)
 
-	if !strings.HasSuffix(remoteName, "."+n.Domain) {
-		return errors.New("the common name of the peer is not in the same domain as the local node")
+	_, err := remoteCert.Verify(x509.VerifyOptions{
+		Roots: n.CAPool,
+	})
+	var remoteBelongsToInternalCA bool
+	if err != nil {
+		// Possibly an external peer
+		if _, ok := n.PeerCerts.Certs[remoteID]; ok {
+			err = nil
+			remoteBelongsToInternalCA = false
+		} else {
+			return errors.New("unable to verify peer certificate")
+		}
+	} else {
+		remoteBelongsToInternalCA = true
+	}
+
+	// If we are in different domains or under different CAs
+	if !strings.HasSuffix(remoteName, "."+n.Domain) || !remoteBelongsToInternalCA {
+		log.Printf("Attempting to establish connection with an external peer with name: %s.", remoteName)
 	}
 
 	peerOut := make(chan *protocol.Message, 128)
