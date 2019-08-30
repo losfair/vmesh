@@ -22,6 +22,7 @@ import (
 	"math"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -73,13 +74,44 @@ type NodeConfig struct {
 	VifName               string       `json:"vif_name"`
 }
 
+type PrefixWhitelistEntryProps struct {
+	MaxPrefixLen uint8
+}
+
+func ParsePrefixWhitelistEntry(entry string) (string, PrefixWhitelistEntryProps) {
+	parts := strings.Split(entry, ",")
+	props := PrefixWhitelistEntryProps{
+		MaxPrefixLen: 128,
+	}
+
+	for i := 1; i < len(parts); i++ {
+		parts := strings.SplitN(parts[i], "=", 2)
+		key := parts[0]
+		value := "true"
+		if len(parts) == 2 {
+			value = parts[1]
+		}
+
+		switch key {
+		case "max_prefix_len":
+			if mpl, err := strconv.ParseUint(value, 10, 8); err == nil {
+				if mpl <= 128 {
+					props.MaxPrefixLen = uint8(mpl)
+				}
+			}
+		default:
+		}
+	}
+	return parts[0], props
+}
+
 type DistributedConfigState struct {
 	sync.Mutex
 	updateTime time.Time
 	Config     *DistributedConfig
 	RawConfig  *protocol.DistributedConfig
 
-	PrefixWhitelistTable map[string]*LikeRoutingTable
+	PrefixWhitelistTable map[string]*LikeRoutingTable // typeof value = PrefixWhitelistEntryProps
 }
 
 func (s *DistributedConfigState) PrefixIsWhitelisted(name string, prefix [16]byte, prefixLen uint8) bool {
@@ -94,9 +126,14 @@ func (s *DistributedConfigState) PrefixIsWhitelisted(name string, prefix [16]byt
 
 	found := false
 
-	_ = table.Lookup(prefix, prefixLen, func(_ [16]byte, _ uint8, _ interface{}) bool {
-		found = true
-		return false
+	_ = table.Lookup(prefix, prefixLen, func(_ [16]byte, _ uint8, _props interface{}) bool {
+		props := _props.(PrefixWhitelistEntryProps)
+		if prefixLen <= props.MaxPrefixLen {
+			found = true
+			return false
+		} else {
+			return true
+		}
 	})
 
 	return found
@@ -108,9 +145,11 @@ func (s *DistributedConfigState) updatePrefixWhitelistTableLocked() {
 	for name, allowed := range s.Config.PrefixWhitelist {
 		table := &LikeRoutingTable{}
 		for _, elem := range allowed {
-			if err := table.InsertCIDR(elem, struct{}{}); err != nil {
+			cidr, props := ParsePrefixWhitelistEntry(elem)
+			if err := table.InsertCIDR(cidr, props); err != nil {
 				log.Println("failed to insert CIDR-format network into whitelist:", err)
 			}
+			log.Printf("Added prefix whitelist entry. Prefix = %s, MaxPrefixLen = %d\n", cidr, props.MaxPrefixLen)
 		}
 		s.PrefixWhitelistTable[name] = table
 	}
