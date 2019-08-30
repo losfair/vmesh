@@ -16,6 +16,7 @@ import (
 	"github.com/losfair/vnet/protocol"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 	peer2 "google.golang.org/grpc/peer"
 	"io/ioutil"
 	"log"
@@ -468,7 +469,10 @@ func (n *Node) Run() error {
 		ClientAuth:   tls.RequireAnyClientCert,
 	})
 
-	server := grpc.NewServer(grpc.Creds(creds))
+	server := grpc.NewServer(grpc.Creds(creds), grpc.KeepaliveParams(keepalive.ServerParameters{
+		Time:    30 * time.Second,
+		Timeout: 10 * time.Second,
+	}))
 	service := &PeerServer{
 		node: n,
 	}
@@ -516,7 +520,10 @@ func (n *Node) Connect(remoteAddr, remoteServerName string, persist bool) error 
 		ServerName:         remoteServerName,
 		InsecureSkipVerify: true, // verification will be handled in ProcessMessageStream
 	})
-	conn, err := grpc.Dial(remoteAddr, grpc.WithTransportCredentials(creds))
+	conn, err := grpc.Dial(remoteAddr, grpc.WithTransportCredentials(creds), grpc.WithKeepaliveParams(keepalive.ClientParameters{
+		Time:    30 * time.Second,
+		Timeout: 10 * time.Second,
+	}))
 	if err != nil {
 		return err
 	}
