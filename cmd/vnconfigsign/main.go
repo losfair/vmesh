@@ -11,7 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/golang/protobuf/proto"
-	"github.com/losfair/vnet/protocol"
+	"github.com/losfair/vmesh/protocol"
 	"io/ioutil"
 	"log"
 	"math/big"

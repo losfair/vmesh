@@ -1,3 +1,3 @@
-package vnet
+package vmesh
 
 var EnableDebug bool = false

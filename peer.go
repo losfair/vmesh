@@ -1,11 +1,11 @@
-package vnet
+package vmesh
 
 import (
 	"bytes"
 	"crypto/x509"
 	"errors"
 	"github.com/golang/protobuf/proto"
-	"github.com/losfair/vnet/protocol"
+	"github.com/losfair/vmesh/protocol"
 	"log"
 	"math"
 	"net"

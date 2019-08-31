@@ -1,4 +1,4 @@
-package vnet
+package vmesh
 
 import (
 	"bytes"
@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	"github.com/losfair/vnet/protocol"
+	"github.com/losfair/vmesh/protocol"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
@@ -476,7 +476,7 @@ func (n *Node) Run() error {
 	service := &PeerServer{
 		node: n,
 	}
-	protocol.RegisterVnetPeerServer(server, service)
+	protocol.RegisterVmeshPeerServer(server, service)
 
 	tcpListener, err := net.Listen("tcp", n.Config.ListenAddr)
 	if err != nil {
@@ -527,7 +527,7 @@ func (n *Node) Connect(remoteAddr, remoteServerName string, persist bool) error 
 	if err != nil {
 		return err
 	}
-	client := protocol.NewVnetPeerClient(conn)
+	client := protocol.NewVmeshPeerClient(conn)
 	session, err := client.Input(context.Background())
 	if err != nil {
 		return err
@@ -665,7 +665,7 @@ type PeerServer struct {
 	node *Node
 }
 
-func (p *PeerServer) Input(server protocol.VnetPeer_InputServer) error {
+func (p *PeerServer) Input(server protocol.VmeshPeer_InputServer) error {
 	return p.node.ProcessMessageStream(server)
 }
 

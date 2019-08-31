@@ -1,4 +1,4 @@
-package vnet
+package vmesh
 
 type Vif interface {
 	GetName() string

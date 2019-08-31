@@ -1,4 +1,4 @@
-module github.com/losfair/vnet
+module github.com/losfair/vmesh
 
 go 1.12
 
