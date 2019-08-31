@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-service VmeshPeer {
+service VnetPeer {
     rpc Input(stream Message) returns (stream Message) {}
 }
 

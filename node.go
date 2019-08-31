@@ -476,7 +476,7 @@ func (n *Node) Run() error {
 	service := &PeerServer{
 		node: n,
 	}
-	protocol.RegisterVmeshPeerServer(server, service)
+	protocol.RegisterVnetPeerServer(server, service)
 
 	tcpListener, err := net.Listen("tcp", n.Config.ListenAddr)
 	if err != nil {
@@ -527,7 +527,7 @@ func (n *Node) Connect(remoteAddr, remoteServerName string, persist bool) error 
 	if err != nil {
 		return err
 	}
-	client := protocol.NewVmeshPeerClient(conn)
+	client := protocol.NewVnetPeerClient(conn)
 	session, err := client.Input(context.Background())
 	if err != nil {
 		return err
@@ -665,7 +665,7 @@ type PeerServer struct {
 	node *Node
 }
 
-func (p *PeerServer) Input(server protocol.VmeshPeer_InputServer) error {
+func (p *PeerServer) Input(server protocol.VnetPeer_InputServer) error {
 	return p.node.ProcessMessageStream(server)
 }
 
