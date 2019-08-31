@@ -21,4 +21,4 @@ OUT_PATH=$(greadlink -f "$3")
 
 cd $(dirname $1)
 
-openssl x509 -req -in "$CSR_PATH" -CA "$CA_PATH.crt" -CAkey "$CA_PATH.key" -CAcreateserial -out "$OUT_PATH"
+openssl x509 -req -in "$CSR_PATH" -CA "$CA_PATH.crt" -CAkey "$CA_PATH.key" -CAcreateserial -out "$OUT_PATH" -days 365

@@ -6,4 +6,4 @@ if [ -z "$1" ]; then
 fi
 
 openssl ecparam -name secp256r1 -genkey -out "$1.key"
-openssl req -new -x509 -key "$1.key" -out "$1.crt"
+openssl req -new -x509 -key "$1.key" -out "$1.crt" -days 3650
