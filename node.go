@@ -46,7 +46,7 @@ type Node struct {
 
 	RoutingTable LikeRoutingTable
 
-	Vif Vif
+	Vifs map[string]Vif
 
 	DCState DistributedConfigState
 }
@@ -60,19 +60,34 @@ type RouteInfo struct {
 	NextPeerID   PeerID
 	TotalLatency uint64
 	UpdateTime   time.Time
+	Vif          Vif // only for local routes
 }
 
 type NodeConfig struct {
-	ListenAddr            string       `json:"listen_addr"`
-	CAPath                string       `json:"ca"`
-	ExternalPeerCertPaths []string     `json:"external_peer_certs"`
-	CertPath              string       `json:"cert"`
-	PrivateKeyPath        string       `json:"private_key"`
-	ServerName            string       `json:"server_name"`
-	LocalAnnouncements    []string     `json:"local_announcements"`
-	Peers                 []PeerConfig `json:"peers"`
-	VifType               string       `json:"vif_type"`
-	VifName               string       `json:"vif_name"`
+	ListenAddr            string               `json:"listen_addr"`
+	CAPath                string               `json:"ca"`
+	ExternalPeerCertPaths []string             `json:"external_peer_certs"`
+	CertPath              string               `json:"cert"`
+	PrivateKeyPath        string               `json:"private_key"`
+	ServerName            string               `json:"server_name"`
+	LocalAnnouncements    []LocalAnnouncement  `json:"local_announcements"`
+	Peers                 []PeerConfig         `json:"peers"`
+	Vifs                  map[string]VifConfig `json:"vifs"`
+}
+
+type LocalAnnouncement struct {
+	Prefix string `json:"prefix"`
+	Vif    string `json:"vif"`
+}
+
+type VifConfig struct {
+	Type string `json:"type"` // required
+
+	// for type: tun
+	TunName string `json:"tun_name"`
+
+	// for type: api
+	APIKey string `json:"api_key"`
 }
 
 type PrefixWhitelistEntryProps struct {
@@ -165,6 +180,17 @@ type PeerConfig struct {
 	Name string `json:"name"`
 }
 
+func (c *VifConfig) Init() (Vif, error) {
+	switch c.Type {
+	case "tun":
+		return NewTun(c.TunName)
+	case "dummy":
+		return (*DummyVif)(nil), nil
+	default:
+		return nil, errors.New("invalid vif type")
+	}
+}
+
 func NewNode(config *NodeConfig) (*Node, error) {
 	fullCert, err := tls.LoadX509KeyPair(config.CertPath, config.PrivateKeyPath)
 	if err != nil {
@@ -216,18 +242,15 @@ func NewNode(config *NodeConfig) (*Node, error) {
 		peerCerts.Certs[certID] = cert
 	}
 
-	var vif Vif
-	switch config.VifType {
-	case "tun":
-		newVif, err := NewTun(config.VifName)
+	vifs := make(map[string]Vif)
+
+	for key, c := range config.Vifs {
+		vif, err := c.Init()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("Failed to init vif '%s': %+v", key, err)
 		}
-		vif = newVif
-	case "dummy", "":
-		vif = (*DummyVif)(nil)
-	default:
-		return nil, errors.New("invalid vif type")
+		vifs[key] = vif
+		log.Printf("Initialized virtual interface '%s'\n", key)
 	}
 
 	domainParts := strings.SplitN(fullCert.Leaf.Subject.CommonName, ".", 2)
@@ -243,20 +266,19 @@ func NewNode(config *NodeConfig) (*Node, error) {
 		FullCert:  fullCert,
 		LocalID:   peerIDFromCertificate(fullCert.Leaf),
 		Domain:    domainParts[1],
-		Vif:       vif,
+		Vifs:      vifs,
 		DCState: DistributedConfigState{
 			PrefixWhitelistTable: make(map[string]*LikeRoutingTable),
 		},
 	}
 
-	log.Println("Virtual interface:", vif.GetName())
 	log.Printf("Local ID: %x\n", n.LocalID)
 	log.Println("Domain:", n.Domain)
 	log.Println("Local name:", n.FullCert.Leaf.Subject.CommonName)
 
 	if len(config.LocalAnnouncements) > 0 {
 		for _, ann := range config.LocalAnnouncements {
-			_, ipnet, err := net.ParseCIDR(ann)
+			_, ipnet, err := net.ParseCIDR(ann.Prefix)
 			if err != nil {
 				return nil, err
 			}
@@ -275,6 +297,7 @@ func NewNode(config *NodeConfig) (*Node, error) {
 					PrefixLength: uint32(prefixLen),
 				},
 				TotalLatency: 0,
+				Vif:          n.Vifs[ann.Vif], // nil by default
 			}); err != nil {
 				return nil, err
 			}
@@ -391,8 +414,12 @@ func (n *Node) DispatchIPPacket(payload []byte) error {
 		if nextPeer != nil {
 			panic("inconsistent routeInfo/nextPeer")
 		}
-		if _, err := n.Vif.Send(payload); err != nil {
-			return err
+		if routeInfo.Vif != nil {
+			if _, err := routeInfo.Vif.Send(payload); err != nil {
+				return err
+			}
+		} else {
+			return errors.New("vif unavailable")
 		}
 	} else {
 		select {
@@ -443,25 +470,29 @@ func (n *Node) GetRouteForAddress(_addr net.IP) (retRouteInfo RouteInfo, retPeer
 	return
 }
 
-func (n *Node) Run() error {
-	go func() {
-		for {
-			buf := make([]byte, 1500)
-			count, err := n.Vif.Recv(buf)
-			if err != nil {
-				if EnableDebug {
-					log.Println("Vif recv error:", err)
-				}
-				continue
+func (n *Node) processVifPackets(vif Vif) {
+	for {
+		buf := make([]byte, 1500)
+		count, err := vif.Recv(buf)
+		if err != nil {
+			if EnableDebug {
+				log.Println("Vif recv error:", err)
 			}
-			payload := buf[:count]
-			if err := n.DispatchIPPacket(payload); err != nil {
-				if EnableDebug {
-					log.Println("DispatchIPPacket error:", err)
-				}
+			continue
+		}
+		payload := buf[:count]
+		if err := n.DispatchIPPacket(payload); err != nil {
+			if EnableDebug {
+				log.Println("DispatchIPPacket error:", err)
 			}
 		}
-	}()
+	}
+}
+
+func (n *Node) Run() error {
+	for _, vif := range n.Vifs {
+		go n.processVifPackets(vif)
+	}
 
 	creds := credentials.NewTLS(&tls.Config{
 		Certificates: []tls.Certificate{n.FullCert},
