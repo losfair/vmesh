@@ -29,3 +29,17 @@ message DistributedConfig {
     bytes certificate = 2;
     bytes content = 3;
 }
+
+enum ChannelType {
+    UDP = 0;
+}
+
+message ChannelRequest {
+    ChannelType type = 1;
+    bytes token = 2;
+}
+
+message ChannelResponse {
+    ChannelType type = 1;
+    bytes token = 2;
+}

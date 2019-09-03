@@ -2,6 +2,7 @@ package vmesh
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/x509"
 	"errors"
 	"github.com/golang/protobuf/proto"
@@ -23,6 +24,9 @@ const (
 	MessageTag_Ping
 	MessageTag_Pong
 	MessageTag_UpdateDistributedConfig
+
+	MessageTag_ChannelRequest
+	MessageTag_ChannelResponse
 )
 
 type PeerID [32]byte
@@ -40,6 +44,17 @@ type Peer struct {
 
 	latency       LatencyMeasurementState
 	atomicLatency uint32
+
+	channelKey [32]byte
+
+	udp UDPChannel
+}
+
+type UDPChannel struct {
+	mu             sync.Mutex
+	peerToken      [32]byte
+	peerAddr       *net.UDPAddr
+	peerUpdateTime time.Time
 }
 
 type LatencyMeasurementState struct {
@@ -210,25 +225,76 @@ func (p *Peer) HandleMessage(msg *protocol.Message) error {
 			log.Println("Applied distributed config.")
 		}
 		return nil
+	case MessageTag_ChannelRequest:
+		var req protocol.ChannelRequest
+		if err := proto.Unmarshal(msg.Payload, &req); err == nil {
+			if req.Type == protocol.ChannelType_UDP {
+				p.udp.mu.Lock()
+				copy(p.udp.peerToken[:], req.Token)
+				p.udp.peerUpdateTime = time.Now()
+				p.udp.mu.Unlock()
+
+				payload := &protocol.ChannelResponse{
+					Type:  protocol.ChannelType_UDP,
+					Token: p.channelKey[:],
+				}
+				marshaled, err := proto.Marshal(payload)
+				if err == nil {
+					select {
+					case p.Out <- &protocol.Message{Tag: uint32(MessageTag_ChannelResponse), Payload: marshaled}:
+					default:
+					}
+				}
+			}
+		}
+		return nil
+	case MessageTag_ChannelResponse:
+		var resp protocol.ChannelResponse
+		if err := proto.Unmarshal(msg.Payload, &resp); err == nil {
+			if resp.Type == protocol.ChannelType_UDP {
+				p.udp.mu.Lock()
+				copy(p.udp.peerToken[:], resp.Token)
+				p.udp.peerUpdateTime = time.Now()
+				p.udp.mu.Unlock()
+			}
+		}
+		return nil
 	default:
-		return errors.New("unknown message tag")
+		return nil
 	}
 }
 
 func (p *Peer) Start() error {
 	p.stop = make(chan struct{})
 
+	if _, err := rand.Read(p.channelKey[:]); err != nil {
+		return err
+	}
+
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 
-		for {
+		secs := uint64(0)
+
+		for ; ; secs++ {
 			select {
 			case <-p.stop:
 				return
 			case <-ticker.C:
+				// UDP keepalive.
+				if secs%1 == 0 {
+					p.udp.mu.Lock()
+					if p.udp.peerAddr != nil && p.udp.peerToken != [32]byte{} {
+						if encoded, ok := p.encodeLocked(nil); ok {
+							_, _ = p.Node.UDPChannelListener.WriteTo(encoded, p.udp.peerAddr)
+						}
+					}
+					p.udp.mu.Unlock()
+				}
+
 				// Test latency.
-				{
+				if (secs+1)%10 == 0 {
 					p.latency.Lock()
 					if !p.latency.inProgress {
 						select {
@@ -242,7 +308,7 @@ func (p *Peer) Start() error {
 				}
 
 				// Send distributed config.
-				{
+				if (secs+2)%30 == 0 {
 					p.Node.DCState.Lock()
 					dconf := p.Node.DCState.RawConfig
 					p.Node.DCState.Unlock()
@@ -261,7 +327,7 @@ func (p *Peer) Start() error {
 				}
 
 				// Announce routes.
-				{
+				if (secs+3)%30 == 0 {
 					routes := make([]*protocol.Route, 0)
 					p.Node.RoutingTable.Range(func(prefix [16]byte, prefixLen uint8, _info interface{}) bool {
 						info := _info.(RouteInfo)
@@ -297,6 +363,69 @@ func (p *Peer) Start() error {
 
 func (p *Peer) Stop() {
 	close(p.stop)
+}
+
+func (p *Peer) encodeLocked(payload []byte) ([]byte, bool) {
+	outLen := 32 + 32 + len(payload)
+	if outLen > 1500 {
+		return nil, false
+	}
+	ret := make([]byte, outLen)
+	copy(ret[0:32], p.LocalID[:])
+	copy(ret[32:64], p.udp.peerToken[:])
+	copy(ret[64:], payload)
+	return ret, true
+}
+
+func (p *Peer) udpCanSendLocked() bool {
+	t := time.Now()
+	return p.udp.peerAddr != nil && t.After(p.udp.peerUpdateTime) && t.Sub(p.udp.peerUpdateTime) < 5*time.Second
+}
+
+func (p *Peer) HandleUDPRecv(raddr *net.UDPAddr, payload []byte) {
+	if len(payload) < 64 || !bytes.Equal(payload[0:32], p.RemoteID[:]) || !bytes.Equal(payload[32:64], p.channelKey[:]) {
+		return
+	}
+
+	p.udp.mu.Lock()
+	p.udp.peerUpdateTime = time.Now()
+	if p.udp.peerAddr == nil || !bytes.Equal(p.udp.peerAddr.IP, raddr.IP) || p.udp.peerAddr.Port != raddr.Port {
+		log.Printf("Received new UDP address for peer %x: %+v\n", p.RemoteID, raddr)
+	}
+	p.udp.peerAddr = raddr
+	p.udp.mu.Unlock()
+
+	body := payload[64:]
+	if len(body) > 0 {
+		if err := p.HandleMessage(&protocol.Message{
+			Tag:     uint32(MessageTag_IP),
+			Payload: body,
+		}); err != nil {
+			if EnableDebug {
+				log.Println(err)
+			}
+		}
+	}
+}
+
+func (p *Peer) SendUDP(payload []byte) bool {
+	p.udp.mu.Lock()
+
+	if p.udpCanSendLocked() {
+		if encoded, ok := p.encodeLocked(payload); ok {
+			peerAddr := p.udp.peerAddr
+			p.udp.mu.Unlock()
+
+			if _, err := p.Node.UDPChannelListener.WriteTo(encoded, peerAddr); err == nil {
+				return true
+			} else {
+				return false
+			}
+		}
+	}
+
+	p.udp.mu.Unlock()
+	return false
 }
 
 func hopPathSimilar(left, right *protocol.Route) bool {

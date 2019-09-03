@@ -2,6 +2,7 @@ package vmesh
 
 import (
 	"github.com/songgao/water"
+	"log"
 )
 
 type Tun struct {
@@ -16,6 +17,8 @@ func NewTun(name string) (*Tun, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	log.Println("Created TUN interface:", ifce.Name())
 
 	return &Tun{
 		ifce: ifce,

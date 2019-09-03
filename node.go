@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/golang/protobuf/proto"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/losfair/vmesh/protocol"
@@ -49,6 +50,9 @@ type Node struct {
 	Vifs map[string]Vif
 
 	DCState DistributedConfigState
+
+	UDPChannelAddr     *net.UDPAddr
+	UDPChannelListener net.PacketConn
 }
 
 type PeerCertCollection struct {
@@ -178,6 +182,7 @@ type DistributedConfig struct {
 type PeerConfig struct {
 	Addr string `json:"addr"`
 	Name string `json:"name"`
+	UDP  bool   `json:"udp"`
 }
 
 func (c *VifConfig) Init() (Vif, error) {
@@ -258,6 +263,11 @@ func NewNode(config *NodeConfig) (*Node, error) {
 		return nil, errors.New("invalid common name")
 	}
 
+	udpAddr, err := net.ResolveUDPAddr("udp", config.ListenAddr)
+	if err != nil {
+		return nil, err
+	}
+
 	n := &Node{
 		Config:    config,
 		CAPool:    caPool,
@@ -270,6 +280,7 @@ func NewNode(config *NodeConfig) (*Node, error) {
 		DCState: DistributedConfigState{
 			PrefixWhitelistTable: make(map[string]*LikeRoutingTable),
 		},
+		UDPChannelAddr: udpAddr,
 	}
 
 	log.Printf("Local ID: %x\n", n.LocalID)
@@ -489,10 +500,47 @@ func (n *Node) processVifPackets(vif Vif) {
 	}
 }
 
+func (n *Node) processUDPPackets() {
+	buf := make([]byte, 1500)
+
+	for {
+		readN, raddr, err := n.UDPChannelListener.ReadFrom(buf)
+		if err != nil || readN == 0 {
+			continue
+		}
+
+		buf := buf[:readN]
+		if len(buf) < 64 {
+			continue
+		}
+
+		var peerID PeerID
+		copy(peerID[:], buf[:32])
+
+		_peer, ok := n.Peers.Load(peerID)
+		if !ok {
+			continue
+		}
+
+		peer := _peer.(*Peer)
+		copied := append([]byte{}, buf...)
+		peer.HandleUDPRecv(raddr.(*net.UDPAddr), copied)
+	}
+}
+
 func (n *Node) Run() error {
 	for _, vif := range n.Vifs {
 		go n.processVifPackets(vif)
 	}
+
+	// Insecure channel
+	udpListener, err := net.ListenUDP("udp", n.UDPChannelAddr)
+	if err != nil {
+		return err
+	}
+
+	n.UDPChannelListener = udpListener
+	go n.processUDPPackets()
 
 	creds := credentials.NewTLS(&tls.Config{
 		Certificates: []tls.Certificate{n.FullCert},
@@ -519,11 +567,11 @@ func (n *Node) Run() error {
 
 func (n *Node) ConnectToAllPeers() {
 	for _, peer := range n.Config.Peers {
-		go n.PersistingConnect(peer.Addr, peer.Name, nil)
+		go n.PersistingConnect(peer, nil)
 	}
 }
 
-func (n *Node) PersistingConnect(remoteAddr, remoteServerName string, oldError error) {
+func (n *Node) PersistingConnect(peer PeerConfig, oldError error) {
 	err := oldError
 	for {
 		if err != nil && strings.Contains(err.Error(), "detected multiple connections") {
@@ -534,8 +582,8 @@ func (n *Node) PersistingConnect(remoteAddr, remoteServerName string, oldError e
 			err = nil
 			continue
 		}
-		log.Printf("Connecting to %s/%s\n", remoteAddr, remoteServerName)
-		if err = n.Connect(remoteAddr, remoteServerName, true); err != nil {
+		log.Printf("Connecting to %s/%s\n", peer.Addr, peer.Name)
+		if err = n.Connect(peer, true); err != nil {
 			log.Printf("Connect failed, waiting for %+v. error = %+v\n", RetryDelay, err)
 			time.Sleep(RetryDelay)
 			continue
@@ -545,13 +593,13 @@ func (n *Node) PersistingConnect(remoteAddr, remoteServerName string, oldError e
 	}
 }
 
-func (n *Node) Connect(remoteAddr, remoteServerName string, persist bool) error {
+func (n *Node) Connect(peer PeerConfig, persist bool) error {
 	creds := credentials.NewTLS(&tls.Config{
 		Certificates:       []tls.Certificate{n.FullCert},
-		ServerName:         remoteServerName,
+		ServerName:         peer.Name,
 		InsecureSkipVerify: true, // verification will be handled in ProcessMessageStream
 	})
-	conn, err := grpc.Dial(remoteAddr, grpc.WithTransportCredentials(creds), grpc.WithKeepaliveParams(keepalive.ClientParameters{
+	conn, err := grpc.Dial(peer.Addr, grpc.WithTransportCredentials(creds), grpc.WithKeepaliveParams(keepalive.ClientParameters{
 		Time:    30 * time.Second,
 		Timeout: 10 * time.Second,
 	}))
@@ -565,7 +613,7 @@ func (n *Node) Connect(remoteAddr, remoteServerName string, persist bool) error 
 	}
 
 	go func() {
-		err := n.ProcessMessageStream(session)
+		err := n.ProcessMessageStream(session, &peer)
 
 		closeErr := session.CloseSend()
 		if closeErr != nil {
@@ -575,7 +623,7 @@ func (n *Node) Connect(remoteAddr, remoteServerName string, persist bool) error 
 		log.Printf("Session closed, error = %+v\n", err)
 		if persist {
 			time.Sleep(RetryDelay)
-			n.PersistingConnect(remoteAddr, remoteServerName, err)
+			n.PersistingConnect(peer, err)
 		}
 	}()
 	return nil
@@ -587,7 +635,7 @@ type MessageStream interface {
 	Context() context.Context
 }
 
-func (n *Node) ProcessMessageStream(stream MessageStream) error {
+func (n *Node) ProcessMessageStream(stream MessageStream, peerConfig *PeerConfig) error {
 	netInfo, ok := peer2.FromContext(stream.Context())
 	if !ok {
 		return errors.New("cannot get network info")
@@ -652,6 +700,30 @@ func (n *Node) ProcessMessageStream(stream MessageStream) error {
 
 	n.Peers.Store(remoteID, peer)
 
+	if peerConfig != nil {
+		if peerConfig.UDP {
+			if udpAddr, err := net.ResolveUDPAddr("udp", peerConfig.Addr); err == nil {
+				peer.udp.mu.Lock()
+				peer.udp.peerAddr = udpAddr
+				peer.udp.mu.Unlock()
+
+				marshaled, err := proto.Marshal(&protocol.ChannelRequest{
+					Type:  protocol.ChannelType_UDP,
+					Token: peer.channelKey[:], // initialized in peer.Start()
+				})
+				if err == nil {
+					select {
+					case peer.Out <- &protocol.Message{Tag: uint32(MessageTag_ChannelRequest), Payload: marshaled}:
+					default:
+						log.Println("Warning: Failed to send channel request")
+					}
+				}
+			} else {
+				log.Println("Warning: Cannot decode peer address for UDP")
+			}
+		}
+	}
+
 	fullyClosed := make(chan struct{})
 
 	go func() {
@@ -661,9 +733,14 @@ func (n *Node) ProcessMessageStream(stream MessageStream) error {
 			close(fullyClosed)
 		}()
 
+	outer:
 		for {
 			select {
 			case msg := <-peerOut:
+				if MessageTag(msg.Tag) == MessageTag_IP && peer.SendUDP(msg.Payload) {
+					goto outer
+				}
+
 				err := stream.Send(msg)
 				if err != nil {
 					return
@@ -697,7 +774,7 @@ type PeerServer struct {
 }
 
 func (p *PeerServer) Input(server protocol.VnetPeer_InputServer) error {
-	return p.node.ProcessMessageStream(server)
+	return p.node.ProcessMessageStream(server, nil)
 }
 
 func peerIDFromCertificate(cert *x509.Certificate) PeerID {
