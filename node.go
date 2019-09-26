@@ -90,8 +90,10 @@ type VifConfig struct {
 	// for type: tun
 	TunName string `json:"tun_name"`
 
-	// for type: api
-	APIKey string `json:"api_key"`
+	// for type: service
+	ServiceName    string `json:"service_name"`
+	ServiceNetwork string `json:"service_network"`
+	ServiceAddress string `json:"service_address"`
 }
 
 type PrefixWhitelistEntryProps struct {
@@ -189,6 +191,8 @@ func (c *VifConfig) Init() (Vif, error) {
 	switch c.Type {
 	case "tun":
 		return NewTun(c.TunName)
+	case "service":
+		return NewBackingService(c.ServiceName, c.ServiceNetwork, c.ServiceAddress)
 	case "dummy":
 		return (*DummyVif)(nil), nil
 	default:
