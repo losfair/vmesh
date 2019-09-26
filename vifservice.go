@@ -1,15 +1,20 @@
 package vmesh
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type BackingService struct {
+	id      [16]byte
 	name    string
 	network string
 	address string
@@ -27,7 +32,13 @@ func NewBackingService(name string, network, address string) (*BackingService, e
 		return nil, errors.New("Unsupported network type")
 	}
 
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return nil, err
+	}
+
 	return &BackingService{
+		id:      id,
 		name:    name,
 		network: network,
 		address: address,
@@ -76,8 +87,22 @@ func (s *BackingService) doReconnect() {
 		if addr, err := net.ResolveUnixAddr(s.network, s.address); err != nil {
 			//log.Println("Failed to resolve unix address:", err)
 		} else {
-			if conn, err := net.DialUnix(s.network, nil, addr); err != nil {
-				//log.Println("Failed to dial unix socket:", err)
+			s.mu.Lock()
+			if s.conn != nil {
+				s.conn.Close()
+				s.conn = nil
+			}
+			s.mu.Unlock()
+
+			path := fmt.Sprintf("/tmp/vmesh_service_%s.sock", hex.EncodeToString(s.id[:]))
+			_ = os.Remove(path)
+			laddr, err := net.ResolveUnixAddr("unixgram", path)
+			if err != nil {
+				log.Println("Unable to resolve laddr")
+				return
+			}
+			if conn, err := net.DialUnix(s.network, laddr, addr); err != nil {
+				log.Println("Failed to dial unix socket:", err)
 			} else {
 				s.mu.Lock()
 				s.conn = conn
