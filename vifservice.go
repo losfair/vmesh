@@ -2,6 +2,7 @@ package vmesh
 
 import (
 	"errors"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -14,14 +15,14 @@ type BackingService struct {
 	address string
 
 	mu                     sync.Mutex
-	conn                   net.PacketConn
+	conn                   net.Conn
 	lastReconnect          time.Time
 	reconnectionInProgress uint32 // atomic
 }
 
 func NewBackingService(name string, network, address string) (*BackingService, error) {
 	switch network {
-	case "unixpacket":
+	case "unixgram":
 	default:
 		return nil, errors.New("Unsupported network type")
 	}
@@ -42,9 +43,13 @@ func (s *BackingService) Send(data []byte) (int, error) {
 	defer s.mu.Unlock()
 
 	if s.conn != nil {
-		if n, err := s.conn.WriteTo(data, nil); err == nil {
-			return n, nil
+		if _, err := s.conn.Write(data); err != nil {
+			log.Println("Failed to send packet to backing service:", err)
+		} else {
+			return len(data), nil
 		}
+	} else {
+		log.Println("No connection. Triggering reconnect.")
 	}
 
 	s.triggerReconnect()
@@ -67,12 +72,17 @@ func (s *BackingService) doReconnect() {
 	defer atomic.StoreUint32(&s.reconnectionInProgress, 0)
 
 	switch s.network {
-	case "unixpacket":
-		if addr, err := net.ResolveUnixAddr(s.network, s.address); err == nil {
-			if conn, err := net.DialUnix(s.network, nil, addr); err == nil {
+	case "unixgram":
+		if addr, err := net.ResolveUnixAddr(s.network, s.address); err != nil {
+			//log.Println("Failed to resolve unix address:", err)
+		} else {
+			if conn, err := net.DialUnix(s.network, nil, addr); err != nil {
+				//log.Println("Failed to dial unix socket:", err)
+			} else {
 				s.mu.Lock()
 				s.conn = conn
 				s.mu.Unlock()
+				log.Println("Connection to unixgram socket", s.address, "established")
 			}
 		}
 	default:
@@ -82,14 +92,18 @@ func (s *BackingService) doReconnect() {
 
 func (s *BackingService) Recv(data []byte) (int, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	conn := s.conn
+	s.mu.Unlock()
 
-	if s.conn != nil {
-		if n, _, err := s.conn.ReadFrom(data); err == nil {
+	if conn != nil {
+		if n, err := conn.Read(data); err == nil {
 			return n, nil
 		}
 	}
 
+	s.mu.Lock()
 	s.triggerReconnect()
+	s.mu.Unlock()
+
 	return 0, errors.New("Dead connection to the backing service. Trying to reconnect.")
 }
