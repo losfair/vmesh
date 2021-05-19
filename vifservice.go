@@ -29,7 +29,7 @@ func NewBackingService(name string, network, address string) (*BackingService, e
 	switch network {
 	case "unixgram":
 	default:
-		return nil, errors.New("Unsupported network type")
+		return nil, errors.New("unsupported network type")
 	}
 
 	var id [16]byte
@@ -64,7 +64,7 @@ func (s *BackingService) Send(data []byte) (int, error) {
 	}
 
 	s.triggerReconnect()
-	return 0, errors.New("Dead connection to the backing service. Trying to reconnect.")
+	return 0, errors.New("dead connection to the backing service, trying to reconnect")
 }
 
 func (s *BackingService) triggerReconnect() {
@@ -130,5 +130,5 @@ func (s *BackingService) Recv(data []byte) (int, error) {
 	s.triggerReconnect()
 	s.mu.Unlock()
 
-	return 0, errors.New("Dead connection to the backing service. Trying to reconnect.")
+	return 0, errors.New("dead connection to the backing service, trying to reconnect")
 }

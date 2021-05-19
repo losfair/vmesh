@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/losfair/vmesh/protocol"
+	"google.golang.org/protobuf/proto"
 )
 
 type MessageTag uint32
@@ -190,7 +190,7 @@ func (p *Peer) HandleMessage(msg *protocol.Message) error {
 		defer p.latency.Unlock()
 
 		if !p.latency.inProgress {
-			return errors.New("Pong received without a previous Ping")
+			return errors.New("pong received without a previous Ping")
 		}
 		p.latency.inProgress = false
 		now := time.Now()
@@ -390,7 +390,7 @@ func (p *Peer) HandleUDPRecv(raddr *net.UDPAddr, payload []byte) {
 
 	p.udp.mu.Lock()
 	p.udp.peerUpdateTime = time.Now()
-	if p.udp.peerAddr == nil || !bytes.Equal(p.udp.peerAddr.IP, raddr.IP) || p.udp.peerAddr.Port != raddr.Port {
+	if p.udp.peerAddr == nil || !p.udp.peerAddr.IP.Equal(raddr.IP) || p.udp.peerAddr.Port != raddr.Port {
 		log.Printf("Received new UDP address for peer %x: %+v\n", p.RemoteID, raddr)
 	}
 	p.udp.peerAddr = raddr
@@ -452,11 +452,7 @@ func hopPathSimilar(left, right *protocol.Route) bool {
 		rightTotalLatency += rightLatency
 	}
 
-	if AbsDiffUint64(leftTotalLatency, rightTotalLatency) > 10 {
-		return false
-	}
-
-	return true
+	return AbsDiffUint64(leftTotalLatency, rightTotalLatency) < 10
 }
 
 func AbsDiffUint64(left, right uint64) uint64 {

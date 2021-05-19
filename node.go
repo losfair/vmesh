@@ -21,7 +21,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/losfair/vmesh/protocol"
@@ -29,6 +28,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 	peer2 "google.golang.org/grpc/peer"
+	"google.golang.org/protobuf/proto"
 )
 
 const RetryDelay = 10 * time.Second
@@ -257,7 +257,7 @@ func NewNode(config *NodeConfig) (*Node, error) {
 	for key, c := range config.Vifs {
 		vif, err := c.Init()
 		if err != nil {
-			return nil, fmt.Errorf("Failed to init vif '%s': %+v", key, err)
+			return nil, fmt.Errorf("failed to init vif '%s': %+v", key, err)
 		}
 		vifs[key] = vif
 		log.Printf("Initialized virtual interface '%s'\n", key)
