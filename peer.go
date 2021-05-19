@@ -9,7 +9,6 @@ import (
 	"math"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/losfair/vmesh/protocol"
@@ -32,6 +31,8 @@ const (
 
 type PeerID [32]byte
 
+const LatencySampleSize = 10
+
 type Peer struct {
 	Node       *Node
 	LocalCert  *x509.Certificate
@@ -43,12 +44,20 @@ type Peer struct {
 
 	stop chan struct{}
 
-	latency       LatencyMeasurementState
-	atomicLatency uint32
+	latencyMeasurement LatencyMeasurementState
+	latencyResult      LatencyMeasurementResult
 
 	channelKey [32]byte
 
 	udp UDPChannel
+}
+
+type LatencyMeasurementResult struct {
+	mu sync.RWMutex
+
+	latencyLog       [LatencySampleSize]uint32
+	latencyFillCount int
+	latencyLogIndex  int
 }
 
 type UDPChannel struct {
@@ -65,7 +74,29 @@ type LatencyMeasurementState struct {
 }
 
 func (p *Peer) GetLatencyMs() uint32 {
-	return atomic.LoadUint32(&p.atomicLatency)
+	p.latencyResult.mu.RLock()
+	defer p.latencyResult.mu.RUnlock()
+
+	// We haven't got any latency information yet
+	if p.latencyResult.latencyFillCount == 0 {
+		return math.MaxUint32
+	}
+
+	var total uint64
+	for i := 0; i < p.latencyResult.latencyFillCount; i++ {
+		total += uint64(p.latencyResult.latencyLog[i])
+	}
+	return uint32(total / uint64(p.latencyResult.latencyFillCount))
+}
+
+func (p *Peer) PushLatencyLog(ms uint32) {
+	p.latencyResult.mu.Lock()
+	if p.latencyResult.latencyFillCount < LatencySampleSize {
+		p.latencyResult.latencyFillCount += 1
+	}
+	p.latencyResult.latencyLog[p.latencyResult.latencyLogIndex] = ms
+	p.latencyResult.latencyLogIndex = (p.latencyResult.latencyLogIndex + 1) % LatencySampleSize
+	p.latencyResult.mu.Unlock()
 }
 
 func (p *Peer) HandleMessage(msg *protocol.Message) error {
@@ -186,27 +217,20 @@ func (p *Peer) HandleMessage(msg *protocol.Message) error {
 		}
 		return nil
 	case MessageTag_Pong:
-		p.latency.Lock()
-		defer p.latency.Unlock()
+		p.latencyMeasurement.Lock()
+		defer p.latencyMeasurement.Unlock()
 
-		if !p.latency.inProgress {
+		if !p.latencyMeasurement.inProgress {
 			return errors.New("pong received without a previous Ping")
 		}
-		p.latency.inProgress = false
+		p.latencyMeasurement.inProgress = false
 		now := time.Now()
-		if now.Before(p.latency.measureStart) {
+		if now.Before(p.latencyMeasurement.measureStart) {
 			log.Println("Ignoring Pong as now.Before(p.latency.measureStart) == true")
 			return nil
 		}
-		latencyMs := uint32(now.Sub(p.latency.measureStart).Nanoseconds() / int64(time.Millisecond))
-		oldLatencyMs := atomic.LoadUint32(&p.atomicLatency)
-
-		// latency is known before...
-		if oldLatencyMs != math.MaxUint32 {
-			latencyMs = uint32((uint64(oldLatencyMs) + uint64(latencyMs)) / 2)
-		}
-
-		atomic.StoreUint32(&p.atomicLatency, latencyMs)
+		latencyMs := uint32(now.Sub(p.latencyMeasurement.measureStart).Nanoseconds() / int64(time.Millisecond))
+		p.PushLatencyLog(latencyMs)
 		return nil
 	case MessageTag_UpdateDistributedConfig:
 		var dconf protocol.DistributedConfig
@@ -296,16 +320,16 @@ func (p *Peer) Start() error {
 
 				// Test latency.
 				if (secs+1)%10 == 0 {
-					p.latency.Lock()
-					if !p.latency.inProgress {
+					p.latencyMeasurement.Lock()
+					if !p.latencyMeasurement.inProgress {
 						select {
 						case p.Out <- &protocol.Message{Tag: uint32(MessageTag_Ping)}:
-							p.latency.inProgress = true
-							p.latency.measureStart = time.Now()
+							p.latencyMeasurement.inProgress = true
+							p.latencyMeasurement.measureStart = time.Now()
 						default:
 						}
 					}
-					p.latency.Unlock()
+					p.latencyMeasurement.Unlock()
 				}
 
 				// Send distributed config.

@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"math"
 	"net"
 	"sort"
 	"strconv"
@@ -689,8 +688,6 @@ func (n *Node) ProcessMessageStream(stream MessageStream, peerConfig *PeerConfig
 		RemoteID:   remoteID,
 		RemoteName: remoteName,
 		Out:        peerOut,
-
-		atomicLatency: math.MaxUint32, // before we get the latency measurement information
 	}
 
 	if _, loaded := n.Peers.LoadOrStore(remoteID, nil); loaded {
