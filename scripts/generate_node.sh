@@ -5,5 +5,5 @@ if [ -z "$1" ]; then
     exit 1
 fi
 
-openssl ecparam -name secp256r1 -genkey -out "$1.key"
+openssl genpkey -algorithm ed25519 -out "$1.key"
 openssl req -new -key "$1.key" -out "$1.csr"

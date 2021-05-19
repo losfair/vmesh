@@ -15,9 +15,9 @@ if [ -z "$3" ]; then
     exit 1
 fi
 
-CA_PATH=$(greadlink -f "$1")
-CSR_PATH=$(greadlink -f "$2")
-OUT_PATH=$(greadlink -f "$3")
+CA_PATH=$(readlink -f "$1")
+CSR_PATH=$(readlink -f "$2")
+OUT_PATH=$(readlink -f "$3")
 
 cd $(dirname $1)
 
