@@ -5,14 +5,15 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"errors"
-	"github.com/golang/protobuf/proto"
-	"github.com/losfair/vmesh/protocol"
 	"log"
 	"math"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/golang/protobuf/proto"
+	"github.com/losfair/vmesh/protocol"
 )
 
 type MessageTag uint32
@@ -336,12 +337,12 @@ func (p *Peer) Start() error {
 							return true
 						}
 
-						route := *info.Route
+						route := info.Route
 						route.Path = append([]*protocol.Hop{{
 							Id:      p.LocalID[:],
 							Latency: p.GetLatencyMs(),
 						}}, route.Path...)
-						routes = append(routes, &route)
+						routes = append(routes, route)
 						return true
 					})
 					ann := &protocol.Announcement{Routes: routes}
