@@ -1,4 +1,5 @@
 syntax = "proto3";
+option go_package = "github.com/losfair/vmesh/protocol";
 
 service VnetPeer {
     rpc Input(stream Message) returns (stream Message) {}

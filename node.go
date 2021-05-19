@@ -11,14 +11,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"github.com/golang/protobuf/proto"
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/losfair/vmesh/protocol"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/keepalive"
-	peer2 "google.golang.org/grpc/peer"
 	"io/ioutil"
 	"log"
 	"math"
@@ -28,6 +20,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/golang/protobuf/proto"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/losfair/vmesh/protocol"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
+	peer2 "google.golang.org/grpc/peer"
 )
 
 const RetryDelay = 10 * time.Second
@@ -774,6 +775,7 @@ func (n *Node) ProcessMessageStream(stream MessageStream, peerConfig *PeerConfig
 }
 
 type PeerServer struct {
+	protocol.UnimplementedVnetPeerServer
 	node *Node
 }
 
